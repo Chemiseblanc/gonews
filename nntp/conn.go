@@ -2,110 +2,143 @@ package nntp
 
 import (
 	"bufio"
-	"crypto/tls"
-	"errors"
+	"fmt"
+	"io"
 	"net"
-	"strings"
+	"net/http"
+	"net/textproto"
 )
 
+// Conn is a stateful connection that that allows for buffered IO
 type Conn struct {
-	rwc net.Conn
+	net.Conn
+	br *bufio.Reader
+	bw *bufio.Writer
 
-	server *Server
-	state  State
+	isTLS bool
+
+	server        *Server
+	articleNumber *uint
+	group         *Group
 }
 
 var commandMap = map[string]func(*Conn, []string) error{
-	"ARTICLE":      (*Conn).article,
-	"BODY":         (*Conn).body,
-	"CAPABILITIES": (*Conn).capabilities,
-	"DATE":         (*Conn).date,
-	"GROUP":        (*Conn).group,
-	"HDR":          (*Conn).hdr,
-	"HEAD":         (*Conn).head,
-	"HELP":         (*Conn).help,
-	"IHAVE":        (*Conn).ihave,
-	"LAST":         (*Conn).last,
-	"LIST":         (*Conn).list,
-	"LISTGROUP":    (*Conn).listgroup,
-	"MODE":         (*Conn).mode,
-	"NEWGROUPS":    (*Conn).newgroups,
-	"NEWNEWS":      (*Conn).newnews,
-	"NEXT":         (*Conn).next,
-	"OVER":         (*Conn).over,
-	"POST":         (*Conn).post,
-	"STAT":         (*Conn).stat,
-	"QUIT":         (*Conn).quit,
-	"STARTTLS":     (*Conn).starttls,
+	"ARTICLE":      ArticleHander,
+	"BODY":         BodyHandler,
+	"CAPABILITIES": CapabilitiesHandler,
+	"DATE":         DateHandler,
+	"GROUP":        GroupHandler,
+	"HDR":          HdrHandler,
+	"HEAD":         HeadHandler,
+	"HELP":         HelpHandler,
+	"IHAVE":        IhaveHandler,
+	"LAST":         LastHandler,
+	"LIST":         ListHandler,
+	"LISTGROUP":    ListgroupHandler,
+	"MODE":         ModeHandler,
+	"NEWGROUPS":    NewgroupsHandler,
+	"NEWNEWS":      NewnewsHandler,
+	"NEXT":         NextHandler,
+	"OVER":         OverHandler,
+	"POST":         PostHandler,
+	"STAT":         StatHandler,
+	"QUIT":         QuitHandler,
+	"STARTTLS":     StarttlsHandler,
 }
 
-func require_arg_length(args []string, length int) error {
-	if len(args) != length {
-		return errors.New(command_syntax_error)
+// StorageBackend is an alias for retrieving the storage interface associated
+// with the server that accepted this connection
+func (c *Conn) StorageBackend() Storage {
+	return c.server.storage
+}
+
+// MessageFilter is an alias for retrieving the message filtering function associated
+// with the server that accepted this connection
+func (c *Conn) MessageFilter() FilterFunc {
+	return c.server.filter
+}
+
+// AuthBackend is an alias for retrieving the authentication interface associated
+// with the server that accepted this connection
+func (c *Conn) AuthBackend() Auth {
+	return c.server.auth
+}
+
+// CurrentArticle retrieves the article pointed to by the connections current group
+// and article number, returning nil if there is no such existing article
+func (c *Conn) CurrentArticle() *Article {
+	if c.articleNumber != nil {
+		s := c.StorageBackend()
+		a, err := s.ArticleByGroup(*c.group, *c.articleNumber)
+		if err != nil {
+			return nil
+		} else {
+			return a
+		}
 	} else {
 		return nil
 	}
 }
 
-func (conn *Conn) serve() {
-	s := bufio.NewScanner(conn.rwc)
+// ReadLine reads a CR-LF delimited line from the socket
+func (c *Conn) ReadLine() (string, error) {
+	reader := textproto.NewReader(c.br)
+	return reader.ReadLine()
+}
 
-	for s.Scan() {
-		cmd_args := strings.Fields(s.Text())
-		cmd, args := cmd_args[0], cmd_args[1:]
-		cmd = strings.ToUpper(cmd)
-		if handler, ok := commandMap[cmd]; ok {
-			err := handler(conn, args)
-			if err != nil {
-				conn.rwc.Write([]byte(err.Error()))
-			}
-		}
+// ReadArticle reads a dot-encoded, CR-LF delimited MIME message from the socket
+func (c *Conn) ReadArticle() (*Article, error) {
+	reader := textproto.NewReader(c.br)
+	header, err := reader.ReadMIMEHeader()
+	if err != nil {
+		return nil, err
 	}
+	return &Article{
+		header,
+		reader.DotReader(),
+	}, nil
+
 }
 
-func (c *Conn) group(args []string) error {
-	return nil
-
-}
-func (c *Conn) article(args []string) error {
-	return nil
-}
-func (c *Conn) head(args []string) error {
-	return nil
-}
-func (c *Conn) body(args []string) error {
-	return nil
-}
-func (c *Conn) stat(args []string) error {
-	return nil
-}
-func (c *Conn) last(args []string) error {
-	return nil
-}
-func (c *Conn) next(args []string) error {
-	return nil
-}
-func (c *Conn) post(args []string) error {
-	return nil
-}
-func (c *Conn) ihave(args []string) error {
-	return nil
-}
-func (c *Conn) newgroups(args []string) error {
-	return nil
-}
-func (c *Conn) newnews(args []string) error {
-	return nil
+// WriteLine formats a string and writes it to the socket with CR-LF line ending
+func (c *Conn) WriteLine(text string, args ...interface{}) error {
+	return textproto.NewWriter(c.bw).PrintfLine(text, args...)
 }
 
-func (c *Conn) quit(args []string) error {
-	return nil
+func (c *Conn) WriteResponse(code int, args ...interface{}) error {
+	return textproto.NewWriter(c.bw).PrintfLine(ResponseText(code, args...))
 }
-func (c *Conn) starttls(args []string) error {
-	if c.server.TLSConfig != nil {
-		tlsConn := tls.Server(c.rwc, c.server.TLSConfig)
-		c.rwc = net.Conn(tlsConn)
-		c.serve()
+
+// WriteHeaders writes a dot-encoded listing of article headers to the socket with CR-LF delimiters
+func (c *Conn) WriteHeaders(article Article) error {
+	writer := textproto.NewWriter(c.bw).DotWriter()
+	h := http.Header(article.MIMEHeader)
+	if err := h.Write(writer); err != nil {
+		return err
 	}
-	return nil
+	return writer.Close()
+}
+
+// WriteBody writes a dot-encoded CR-LF delimited message to the socket
+func (c *Conn) WriteBody(article Article) error {
+	writer := textproto.NewWriter(c.bw).DotWriter()
+	if _, err := io.Copy(writer, article.Body); err != nil {
+		return err
+	}
+	return writer.Close()
+}
+
+// WriteArticle writes a dot-encoded CR-LF delimited MIME message to the socket
+func (c *Conn) WriteArticle(article Article) error {
+	writer := textproto.NewWriter(c.bw).DotWriter()
+	if err := http.Header(article.MIMEHeader).Write(writer); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(writer, ""); err != nil {
+		return err
+	}
+	if _, err := io.Copy(writer, article.Body); err != nil {
+		return err
+	}
+	return writer.Close()
 }
